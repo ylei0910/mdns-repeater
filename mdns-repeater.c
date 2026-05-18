@@ -52,6 +52,7 @@ struct if_sock {
 	struct in_addr addr;	/* interface addr  */
 	struct in_addr mask;	/* interface mask  */
 	struct in_addr net;	/* interface network (computed) */
+	int query_only;		/* only forward DNS queries (QR=0) originating from this interface */
 };
 
 struct subnet {
@@ -76,6 +77,7 @@ void *pkt_data = NULL;
 
 int foreground = 0;
 int shutdown_flag = 0;
+int first_iface_query_only = 0;
 
 char *pid_file = PIDFILE;
 
@@ -222,7 +224,8 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	char *addr_str = strdup(inet_ntoa(sockdata->addr));
 	char *mask_str = strdup(inet_ntoa(sockdata->mask));
 	char *net_str  = strdup(inet_ntoa(sockdata->net));
-	log_message(LOG_INFO, "dev %s addr %s mask %s net %s", ifr.ifr_name, addr_str, mask_str, net_str);
+	log_message(LOG_INFO, "dev %s addr %s mask %s net %s%s", ifr.ifr_name, addr_str, mask_str, net_str,
+		sockdata->query_only ? " [query-only]" : "");
 	free(addr_str);
 	free(mask_str);
 	free(net_str);
@@ -339,7 +342,7 @@ static void show_help(const char *progname) {
 	fprintf(stderr, "mDNS repeater (version " HGVERSION ")\n");
 	fprintf(stderr, "Copyright (C) 2011 Darell Tan\n\n");
 
-	fprintf(stderr, "usage: %s [ -f ] <ifdev> ...\n", progname);
+	fprintf(stderr, "usage: %s [ -f ] [ -Q ] <ifdev> ...\n", progname);
 	fprintf(stderr, "\n"
 					"<ifdev> specifies an interface like \"eth0\"\n"
 					"packets received on an interface is repeated across all other specified interfaces\n"
@@ -347,6 +350,9 @@ static void show_help(const char *progname) {
 					"\n"
 					" flags:\n"
 					"	-f	runs in foreground for debugging\n"
+					"	-Q	marks the first interface as query-only source:\n"
+					"		only DNS queries (QR=0) from it are forwarded;\n"
+					"		responses and announcements are suppressed\n"
 					"	-b	blacklist subnet (eg. 192.168.1.1/24)\n"
 					"	-w	whitelist subnet (eg. 192.168.1.1/24)\n"
 					"	-p	specifies the pid file path (default: " PIDFILE ")\n"
@@ -411,10 +417,11 @@ static int parse_opts(int argc, char *argv[]) {
 	int help = 0;
 	struct subnet *ss;
 	char *msg;
-	while ((c = getopt(argc, argv, "hfp:b:w:u:")) != -1) {
+	while ((c = getopt(argc, argv, "hfQp:b:w:u:")) != -1) {
 		switch (c) {
 			case 'h': help = 1; break;
 			case 'f': foreground = 1; break;
+			case 'Q': first_iface_query_only = 1; break;
 			case 'p':
 				if (optarg[0] != '/')
 					log_message(LOG_ERR, "pid file path must be absolute");
@@ -546,6 +553,8 @@ int main(int argc, char *argv[]) {
 			exit(2);
 		}
 
+		socks[num_socks].query_only = (first_iface_query_only && num_socks == 0) ? 1 : 0;
+
 		int sockfd = create_send_sock(server_sockfd, argv[i], &socks[num_socks]);
 		if (sockfd < 0) {
 			log_message(LOG_ERR, "unable to create socket for interface %s", argv[i]);
@@ -602,10 +611,12 @@ int main(int argc, char *argv[]) {
 			int j;
 			char discard = 0;
 			char our_net = 0;
+			int src_sock = -1;
 			for (j = 0; j < num_socks; j++) {
 				// make sure packet originated from specified networks
 				if ((fromaddr.sin_addr.s_addr & socks[j].mask.s_addr) == socks[j].net.s_addr) {
 					our_net = 1;
+					src_sock = j;
 				}
 
 				// check for loopback
@@ -650,6 +661,18 @@ int main(int argc, char *argv[]) {
 				}
 			}
 
+			// If packet came from a query-only interface, suppress responses/announcements (QR=1).
+			// DNS flags are at bytes [2][3] of the payload; QR bit is the MSB of byte [2].
+			if (src_sock >= 0 && socks[src_sock].query_only && recvsize >= 3) {
+				unsigned char *dns = (unsigned char *)pkt_data;
+				if (dns[2] & 0x80) {
+					if (foreground)
+						printf("suppressing announcement from query-only iface %s (from=%s)\n",
+							socks[src_sock].ifname, inet_ntoa(fromaddr.sin_addr));
+					continue;
+				}
+			}
+
 			if (foreground)
 				printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
 
@@ -657,6 +680,19 @@ int main(int argc, char *argv[]) {
 				// do not repeat packet back to the same network from which it originated
 				if ((fromaddr.sin_addr.s_addr & socks[j].mask.s_addr) == socks[j].net.s_addr)
 					continue;
+
+				// If destination is the Q interface and source is a non-Q (IoT) interface,
+				// only forward announcements (QR=1) — suppress queries from IoT to personal.
+				// IoT-to-IoT forwarding is unrestricted.
+				if (src_sock >= 0 && !socks[src_sock].query_only && socks[j].query_only && recvsize >= 3) {
+					unsigned char *dns = (unsigned char *)pkt_data;
+					if (!(dns[2] & 0x80)) {
+						if (foreground)
+							printf("suppressing query from IoT iface %s to Q iface %s (from=%s)\n",
+								socks[src_sock].ifname, socks[j].ifname, inet_ntoa(fromaddr.sin_addr));
+						continue;
+					}
+				}
 
 				if (foreground)
 					printf("repeating data to %s\n", socks[j].ifname);
