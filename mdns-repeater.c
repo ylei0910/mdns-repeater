@@ -56,6 +56,7 @@ struct if_sock {
 	struct in_addr mask;
 	struct in_addr net;
 	int query_only;
+	char subnet_str[32];  /* "10.108.0.0/16" — pre-computed at setup */
 };
 
 struct subnet {
@@ -108,6 +109,7 @@ FILE *debug_log_fp = NULL;
 
 char *service_filter_file = NULL;
 static char **filter_services = NULL;
+static size_t *filter_service_lens = NULL;
 static int num_filter_services = 0;
 
 #define MAX_SEEN_NAMES 4096
@@ -232,7 +234,11 @@ static int load_service_filter(const char *file) {
 		if (len == 0 || line[0] == '#') continue;
 		char **tmp = realloc(filter_services, (num_filter_services + 1) * sizeof(char *));
 		if (!tmp) { fclose(f); return -1; }
+		size_t *ltmp = realloc(filter_service_lens, (num_filter_services + 1) * sizeof(size_t));
+		if (!ltmp) { fclose(f); return -1; }
 		filter_services = tmp;
+		filter_service_lens = ltmp;
+		filter_service_lens[num_filter_services] = (size_t)len;
 		filter_services[num_filter_services++] = strdup(line);
 	}
 	fclose(f);
@@ -264,7 +270,7 @@ static int packet_matches_filter(const unsigned char *pkt, size_t pktlen) {
 		size_t name_len = strlen(name);
 		int j;
 		for (j = 0; j < num_filter_services; j++) {
-			size_t svc_len = strlen(filter_services[j]);
+			size_t svc_len = filter_service_lens[j];
 			if (name_len < svc_len) continue;
 			const char *suffix = name + name_len - svc_len;
 			if ((suffix == name || *(suffix - 1) == '.') &&
@@ -431,7 +437,7 @@ static int create_recv_sock() {
 	}
 
 #ifdef IP_PKTINFO
-	if ((r = setsockopt(sd, SOL_IP, IP_PKTINFO, &on, sizeof(on))) < 0) {
+	if ((r = setsockopt(sd, IPPROTO_IP, IP_PKTINFO, &on, sizeof(on))) < 0) {
 		log_message(LOG_ERR, "recv setsockopt(IP_PKTINFO): %s", strerror(errno));
 		return r;
 	}
@@ -470,6 +476,8 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 		memcpy(&sockdata->addr, if_addr, sizeof(struct in_addr));
 
 	sockdata->net.s_addr = sockdata->addr.s_addr & sockdata->mask.s_addr;
+	snprintf(sockdata->subnet_str, sizeof(sockdata->subnet_str), "%s/%d",
+		inet_ntoa(sockdata->net), mask_to_prefix(sockdata->mask));
 
 	int on = 1;
 	if ((r = setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) < 0) {
@@ -999,10 +1007,19 @@ int main(int argc, char *argv[]) {
 			if (foreground)
 				printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
 
+			/* Service filter — fail fast before computing destinations */
+			if (!packet_matches_filter((unsigned char *)pkt_data, (size_t)recvsize)) {
+				if (foreground)
+					printf("filtered packet from=%s\n", inet_ntoa(fromaddr.sin_addr));
+				log_packet_names(src_ip, (unsigned char *)pkt_data, (size_t)recvsize, "SKIP:service");
+				continue;
+			}
+
 			/* Compute actual destination list (routing table + Q-only + same-net) */
 			int actual_dests[MAX_SOCKS];
 			int num_actual_dests = 0;
 			char dest_buf[256] = "->";
+			size_t dest_len = 2;
 			for (j = 0; j < routing[src_sock].num_dests; j++) {
 				int dest = routing[src_sock].dests[j];
 				if ((fromaddr.sin_addr.s_addr & socks[dest].mask.s_addr) == socks[dest].net.s_addr)
@@ -1012,18 +1029,8 @@ int main(int argc, char *argv[]) {
 					if (!(dns[2] & 0x80)) continue;
 				}
 				actual_dests[num_actual_dests++] = dest;
-				char s[32];
-				snprintf(s, sizeof(s), " %s/%d",
-					inet_ntoa(socks[dest].net), mask_to_prefix(socks[dest].mask));
-				strncat(dest_buf, s, sizeof(dest_buf) - strlen(dest_buf) - 1);
-			}
-
-			/* Service filter — log skipped names before dropping */
-			if (!packet_matches_filter((unsigned char *)pkt_data, (size_t)recvsize)) {
-				if (foreground)
-					printf("filtered packet from=%s\n", inet_ntoa(fromaddr.sin_addr));
-				log_packet_names(src_ip, (unsigned char *)pkt_data, (size_t)recvsize, "SKIP:service");
-				continue;
+				dest_len += snprintf(dest_buf + dest_len, sizeof(dest_buf) - dest_len,
+					" %s", socks[dest].subnet_str);
 			}
 
 			/* Log and forward */
@@ -1056,6 +1063,7 @@ end_main:
 		for (i = 0; i < num_filter_services; i++) free(filter_services[i]);
 		free(filter_services);
 	}
+	if (filter_service_lens != NULL) free(filter_service_lens);
 
 	if (server_sockfd >= 0) close(server_sockfd);
 
