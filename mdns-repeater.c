@@ -34,6 +34,7 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <errno.h>
+#include <stdint.h>
 
 #define PACKAGE "mdns-repeater"
 #define MDNS_ADDR "224.0.0.251"
@@ -82,6 +83,90 @@ int first_iface_query_only = 0;
 char *pid_file = PIDFILE;
 
 const struct passwd* user = NULL;
+
+char *debug_log_file = NULL;
+FILE *debug_log_fp = NULL;
+
+#define MAX_SEEN_NAMES 4096
+#define SEEN_KEY_LEN 320
+static char seen_keys[MAX_SEEN_NAMES][SEEN_KEY_LEN];
+
+static int seen_add(const char *key) {
+	unsigned int h = 5381;
+	const char *p;
+	for (p = key; *p; p++) h = h * 33 ^ (unsigned char)*p;
+	h %= MAX_SEEN_NAMES;
+	unsigned int i = h;
+	do {
+		if (seen_keys[i][0] == '\0') {
+			strncpy(seen_keys[i], key, SEEN_KEY_LEN - 1);
+			return 1;
+		}
+		if (strcmp(seen_keys[i], key) == 0) return 0;
+		i = (i + 1) % MAX_SEEN_NAMES;
+	} while (i != h);
+	return 1;
+}
+
+static int dns_read_name(const unsigned char *pkt, size_t pktlen, size_t offset,
+                          char *out, size_t outlen) {
+	size_t pos = offset, out_pos = 0, first_end = 0;
+	int jumped = 0, jumps = 0;
+	while (pos < pktlen && jumps <= 10) {
+		unsigned char label_len = pkt[pos];
+		if (label_len == 0) {
+			if (!jumped) first_end = pos + 1;
+			if (out_pos > 0 && out[out_pos - 1] == '.') out_pos--;
+			out[out_pos] = '\0';
+			return (int)(first_end - offset);
+		}
+		if ((label_len & 0xC0) == 0xC0) {
+			if (pos + 1 >= pktlen) return -1;
+			if (!jumped) first_end = pos + 2;
+			jumped = 1;
+			pos = ((label_len & 0x3F) << 8) | pkt[pos + 1];
+			jumps++;
+			continue;
+		}
+		if (label_len & 0xC0) return -1;
+		pos++;
+		if (pos + label_len > pktlen || out_pos + label_len + 1 >= outlen) return -1;
+		memcpy(out + out_pos, pkt + pos, label_len);
+		out_pos += label_len;
+		out[out_pos++] = '.';
+		pos += label_len;
+	}
+	return -1;
+}
+
+static void log_packet_names(const char *ifname, const unsigned char *pkt, size_t pktlen) {
+	if (!debug_log_fp || pktlen < 12) return;
+	uint16_t qdcount = (pkt[4] << 8) | pkt[5];
+	uint16_t ancount = (pkt[6] << 8) | pkt[7];
+	uint16_t total = qdcount + ancount;
+	size_t pos = 12;
+	char name[256], key[320];
+	int consumed;
+	uint16_t i;
+	for (i = 0; i < total && pos < pktlen; i++) {
+		consumed = dns_read_name(pkt, pktlen, pos, name, sizeof(name));
+		if (consumed <= 0) break;
+		pos += (size_t)consumed;
+		if (i < qdcount) {
+			if (pos + 4 > pktlen) break;
+			pos += 4;
+		} else {
+			if (pos + 10 > pktlen) break;
+			uint16_t rdlen = (pkt[pos + 8] << 8) | pkt[pos + 9];
+			pos += 10 + rdlen;
+		}
+		snprintf(key, sizeof(key), "%s %s", ifname, name);
+		if (seen_add(key)) {
+			fprintf(debug_log_fp, "%s %s\n", ifname, name);
+			fflush(debug_log_fp);
+		}
+	}
+}
 
 void log_message(int loglevel, char *fmt_str, ...) {
 	va_list ap;
@@ -357,6 +442,7 @@ static void show_help(const char *progname) {
 					"	-w	whitelist subnet (eg. 192.168.1.1/24)\n"
 					"	-p	specifies the pid file path (default: " PIDFILE ")\n"
 					"	-u	run as this user (by name)\n"
+					"	-d	log repeated mDNS names to file (deduped, format: <iface> <name>)\n"
 					"	-h	shows this help\n"
 					"\n"
 		);
@@ -417,7 +503,7 @@ static int parse_opts(int argc, char *argv[]) {
 	int help = 0;
 	struct subnet *ss;
 	char *msg;
-	while ((c = getopt(argc, argv, "hfQp:b:w:u:")) != -1) {
+	while ((c = getopt(argc, argv, "hfQp:b:w:u:d:")) != -1) {
 		switch (c) {
 			case 'h': help = 1; break;
 			case 'f': foreground = 1; break;
@@ -508,6 +594,10 @@ static int parse_opts(int argc, char *argv[]) {
 				break;
 			}
 
+			case 'd':
+				debug_log_file = optarg;
+				break;
+
 			default:
 				log_message(LOG_ERR, "unknown option %c", optopt);
 				exit(2);
@@ -533,6 +623,13 @@ int main(int argc, char *argv[]) {
 		show_help(argv[0]);
 		log_message(LOG_ERR, "error: at least 2 interfaces must be specified");
 		exit(2);
+	}
+
+	if (debug_log_file) {
+		mkdir("/var/log/mdns-repeater", 0755);
+		debug_log_fp = fopen(debug_log_file, "a");
+		if (!debug_log_fp)
+			log_message(LOG_ERR, "cannot open debug log %s: %s", debug_log_file, strerror(errno));
 	}
 
 	openlog(PACKAGE, LOG_PID | LOG_CONS, LOG_DAEMON);
@@ -676,6 +773,9 @@ int main(int argc, char *argv[]) {
 			if (foreground)
 				printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
 
+			if (src_sock >= 0)
+				log_packet_names(socks[src_sock].ifname, (unsigned char *)pkt_data, (size_t)recvsize);
+
 			for (j = 0; j < num_socks; j++) {
 				// do not repeat packet back to the same network from which it originated
 				if ((fromaddr.sin_addr.s_addr & socks[j].mask.s_addr) == socks[j].net.s_addr)
@@ -716,6 +816,9 @@ end_main:
 
 	if (pkt_data != NULL)
 		free(pkt_data);
+
+	if (debug_log_fp != NULL)
+		fclose(debug_log_fp);
 
 	if (server_sockfd >= 0)
 		close(server_sockfd);
