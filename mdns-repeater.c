@@ -558,10 +558,10 @@ static const char *find_iface_for_subnet(const struct subnet *s) {
 	return result;
 }
 
-static int find_sock_for_net(struct in_addr net, struct in_addr mask) {
+static int find_sock_for_iface(const char *ifname) {
 	int i;
 	for (i = 0; i < num_socks; i++)
-		if (socks[i].net.s_addr == net.s_addr && socks[i].mask.s_addr == mask.s_addr)
+		if (strcmp(socks[i].ifname, ifname) == 0)
 			return i;
 	return -1;
 }
@@ -578,44 +578,50 @@ static void add_route(int src, int dest) {
 static int setup_sockets(int recv_sockfd) {
 	int r, j;
 
-	/* First pass: create one socket per unique subnet */
+	/* First pass: create one socket per unique interface */
 	for (r = 0; r < num_rules; r++) {
 		struct rule *rule = &rules[r];
 
 		/* Q subnet */
-		if (find_sock_for_net(rule->q_subnet.net, rule->q_subnet.mask) < 0) {
+		const char *q_ifname = find_iface_for_subnet(&rule->q_subnet);
+		if (!q_ifname) {
+			log_message(LOG_ERR, "no interface found for subnet %s/%d",
+				inet_ntoa(rule->q_subnet.net), mask_to_prefix(rule->q_subnet.mask));
+			return -1;
+		}
+		if (find_sock_for_iface(q_ifname) < 0) {
 			if (num_socks >= MAX_SOCKS) {
+				free((char *)q_ifname);
 				log_message(LOG_ERR, "too many sockets (max %d)", MAX_SOCKS);
 				return -1;
 			}
-			const char *ifname = find_iface_for_subnet(&rule->q_subnet);
-			if (!ifname) {
-				log_message(LOG_ERR, "no interface found for subnet %s/%d",
-					inet_ntoa(rule->q_subnet.net), mask_to_prefix(rule->q_subnet.mask));
-				return -1;
-			}
 			socks[num_socks].query_only = 1;
-			if (create_send_sock(recv_sockfd, ifname, &socks[num_socks]) < 0) return -1;
+			if (create_send_sock(recv_sockfd, q_ifname, &socks[num_socks]) < 0) return -1;
 			num_socks++;
+		} else {
+			free((char *)q_ifname);
 		}
 
 		/* Destination subnets */
 		for (j = 0; j < rule->num_dests; j++) {
 			struct subnet *ds = &rule->dests[j];
-			if (find_sock_for_net(ds->net, ds->mask) < 0) {
+			const char *d_ifname = find_iface_for_subnet(ds);
+			if (!d_ifname) {
+				log_message(LOG_ERR, "no interface found for subnet %s/%d",
+					inet_ntoa(ds->net), mask_to_prefix(ds->mask));
+				return -1;
+			}
+			if (find_sock_for_iface(d_ifname) < 0) {
 				if (num_socks >= MAX_SOCKS) {
+					free((char *)d_ifname);
 					log_message(LOG_ERR, "too many sockets (max %d)", MAX_SOCKS);
 					return -1;
 				}
-				const char *ifname = find_iface_for_subnet(ds);
-				if (!ifname) {
-					log_message(LOG_ERR, "no interface found for subnet %s/%d",
-						inet_ntoa(ds->net), mask_to_prefix(ds->mask));
-					return -1;
-				}
 				socks[num_socks].query_only = 0;
-				if (create_send_sock(recv_sockfd, ifname, &socks[num_socks]) < 0) return -1;
+				if (create_send_sock(recv_sockfd, d_ifname, &socks[num_socks]) < 0) return -1;
 				num_socks++;
+			} else {
+				free((char *)d_ifname);
 			}
 		}
 	}
@@ -627,12 +633,24 @@ static int setup_sockets(int recv_sockfd) {
 		int participants[MAX_SOCKS + 1];
 		int num_p = 0;
 
-		int qi = find_sock_for_net(rule->q_subnet.net, rule->q_subnet.mask);
-		if (qi >= 0) participants[num_p++] = qi;
+		const char *q_ifname = find_iface_for_subnet(&rule->q_subnet);
+		if (q_ifname) {
+			int qi = find_sock_for_iface(q_ifname);
+			free((char *)q_ifname);
+			if (qi >= 0) participants[num_p++] = qi;
+		}
 
 		for (j = 0; j < rule->num_dests; j++) {
-			int di = find_sock_for_net(rule->dests[j].net, rule->dests[j].mask);
-			if (di >= 0) participants[num_p++] = di;
+			const char *d_ifname = find_iface_for_subnet(&rule->dests[j]);
+			if (d_ifname) {
+				int di = find_sock_for_iface(d_ifname);
+				free((char *)d_ifname);
+				if (di >= 0) {
+					int k, found = 0;
+					for (k = 0; k < num_p; k++) if (participants[k] == di) { found = 1; break; }
+					if (!found) participants[num_p++] = di;
+				}
+			}
 		}
 
 		int a, b;
