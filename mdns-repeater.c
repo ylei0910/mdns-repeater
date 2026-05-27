@@ -914,13 +914,6 @@ int main(int argc, char *argv[]) {
 
 	if (!foreground)
 		daemonize();
-	else {
-		running_pid = already_running();
-		if (running_pid != -1) {
-			log_message(LOG_ERR, "already running as pid %d", running_pid);
-			exit(1);
-		}
-	}
 
 	pkt_data = malloc(PACKET_SIZE);
 	if (pkt_data == NULL) {
