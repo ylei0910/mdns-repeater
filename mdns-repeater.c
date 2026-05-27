@@ -21,7 +21,6 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <fcntl.h>
 #include <signal.h>
 #include <string.h>
 #include <stdio.h>
@@ -40,10 +39,6 @@
 #define PACKAGE "mdns-repeater"
 #define MDNS_ADDR "224.0.0.251"
 #define MDNS_PORT 5353
-
-#ifndef PIDFILE
-#define PIDFILE "/var/run/" PACKAGE ".pid"
-#endif
 
 #define MAX_SOCKS   16
 #define MAX_SUBNETS 16
@@ -96,10 +91,8 @@ static struct routing_entry routing[MAX_SOCKS];
 #define PACKET_SIZE 65536
 void *pkt_data = NULL;
 
-int foreground = 0;
 int shutdown_flag = 0;
 
-char *pid_file = PIDFILE;
 char *rules_file = NULL;
 
 const struct passwd *user = NULL;
@@ -129,10 +122,8 @@ void log_message(int loglevel, char *fmt_str, ...) {
 	va_end(ap);
 	buf[2047] = 0;
 
-	if (foreground)
-		fprintf(stderr, "%s: %s\n", PACKAGE, buf);
-	else
-		syslog(loglevel, "%s", buf);
+	(void)loglevel;
+	fprintf(stderr, "%s: %s\n", PACKAGE, buf);
 }
 
 /* -------------------------------------------------------------------------
@@ -669,71 +660,9 @@ static int setup_sockets(int recv_sockfd) {
 	return 0;
 }
 
-/* -------------------------------------------------------------------------
- * Daemon helpers
- * ---------------------------------------------------------------------- */
-
 static void mdns_repeater_shutdown(int sig) {
 	(void)sig;
 	shutdown_flag = 1;
-}
-
-static pid_t already_running() {
-	FILE *f;
-	int count;
-	pid_t pid;
-
-	f = fopen(pid_file, "r");
-	if (f != NULL) {
-		count = fscanf(f, "%d", &pid);
-		fclose(f);
-		if (count == 1 && kill(pid, 0) == 0)
-			return pid;
-	}
-	return -1;
-}
-
-static int write_pidfile() {
-	FILE *f = fopen(pid_file, "w");
-	if (f != NULL) {
-		int r = fprintf(f, "%d", getpid());
-		fclose(f);
-		return (r > 0);
-	}
-	return 0;
-}
-
-static void daemonize() {
-	pid_t running_pid;
-	pid_t pid = fork();
-	if (pid < 0) { log_message(LOG_ERR, "fork(): %s", strerror(errno)); exit(1); }
-	if (pid > 0) exit(0);
-
-	signal(SIGCHLD, SIG_IGN);
-	signal(SIGHUP,  SIG_IGN);
-	signal(SIGTERM, mdns_repeater_shutdown);
-
-	setsid();
-	umask(0027);
-	if (chdir("/") < 0) { log_message(LOG_ERR, "unable to change to root directory"); exit(1); }
-
-	int i;
-	for (i = 0; i < 3; i++) {
-		close(i);
-		if (open("/dev/null", O_RDWR) != i) {
-			log_message(LOG_ERR, "unable to open /dev/null for fd %d", i);
-			exit(1);
-		}
-	}
-
-	running_pid = already_running();
-	if (running_pid != -1) {
-		log_message(LOG_ERR, "already running as pid %d", running_pid);
-		exit(1);
-	} else if (!write_pidfile()) {
-		log_message(LOG_ERR, "unable to write pid file %s", pid_file);
-		exit(1);
-	}
 }
 
 static void switch_user() {
@@ -763,10 +692,8 @@ static void show_help(const char *progname) {
 					"\n"
 					" flags:\n"
 					"	-r	rules file (required)\n"
-					"	-f	run in foreground for debugging\n"
 					"	-b	blacklist source subnet (eg. 192.168.1.0/24)\n"
 					"	-w	whitelist source subnet (eg. 192.168.1.0/24)\n"
-					"	-p	pid file path (default: " PIDFILE ")\n"
 					"	-u	run as this user (by name)\n"
 					"	-S	only repeat services listed in file (one suffix per line, # comments)\n"
 					"	-d	log repeated mDNS names to file (deduped, format: <subnet> <ip> <name>)\n"
@@ -781,20 +708,12 @@ static void parse_opts(int argc, char *argv[]) {
 	struct subnet *ss;
 	char *msg;
 
-	while ((c = getopt(argc, argv, "hfr:p:b:w:u:S:d:")) != -1) {
+	while ((c = getopt(argc, argv, "hr:b:w:u:S:d:")) != -1) {
 		switch (c) {
 			case 'h': help = 1; break;
-			case 'f': foreground = 1; break;
 
 			case 'r':
 				rules_file = optarg;
-				break;
-
-			case 'p':
-				if (optarg[0] != '/')
-					log_message(LOG_ERR, "pid file path must be absolute");
-				else
-					pid_file = optarg;
 				break;
 
 			case 'b':
@@ -899,8 +818,6 @@ int main(int argc, char *argv[]) {
 			log_message(LOG_ERR, "cannot open debug log %s: %s", debug_log_file, strerror(errno));
 	}
 
-	openlog(PACKAGE, LOG_PID | LOG_CONS, LOG_DAEMON);
-
 	server_sockfd = create_recv_sock();
 	if (server_sockfd < 0) {
 		log_message(LOG_ERR, "unable to create server socket");
@@ -918,8 +835,8 @@ int main(int argc, char *argv[]) {
 
 	if (user) switch_user();
 
-	if (!foreground)
-		daemonize();
+	signal(SIGTERM, mdns_repeater_shutdown);
+	signal(SIGINT,  mdns_repeater_shutdown);
 
 	pkt_data = malloc(PACKET_SIZE);
 	if (pkt_data == NULL) {
@@ -971,22 +888,14 @@ int main(int argc, char *argv[]) {
 					if ((fromaddr.sin_addr.s_addr & whitelisted_subnets[j].mask.s_addr)
 					    == whitelisted_subnets[j].net.s_addr) { ok = 1; break; }
 				}
-				if (!ok) {
-					if (foreground)
-						printf("skipping packet from=%s (not whitelisted)\n", inet_ntoa(fromaddr.sin_addr));
-					continue;
-				}
+				if (!ok) continue;
 			} else if (num_blacklisted_subnets != 0) {
 				char blocked = 0;
 				for (j = 0; j < num_blacklisted_subnets; j++) {
 					if ((fromaddr.sin_addr.s_addr & blacklisted_subnets[j].mask.s_addr)
 					    == blacklisted_subnets[j].net.s_addr) { blocked = 1; break; }
 				}
-				if (blocked) {
-					if (foreground)
-						printf("skipping packet from=%s (blacklisted)\n", inet_ntoa(fromaddr.sin_addr));
-					continue;
-				}
+				if (blocked) continue;
 			}
 
 			char src_ip[INET_ADDRSTRLEN];
@@ -996,21 +905,13 @@ int main(int argc, char *argv[]) {
 			if (socks[src_sock].query_only && recvsize >= 3) {
 				unsigned char *dns = (unsigned char *)pkt_data;
 				if (dns[2] & 0x80) {
-					if (foreground)
-						printf("suppressing announcement from Q iface %s (from=%s)\n",
-							socks[src_sock].ifname, inet_ntoa(fromaddr.sin_addr));
 					log_packet_names(src_ip, (unsigned char *)pkt_data, (size_t)recvsize, "SKIP:Q");
 					continue;
 				}
 			}
 
-			if (foreground)
-				printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
-
 			/* Service filter — fail fast before computing destinations */
 			if (!packet_matches_filter((unsigned char *)pkt_data, (size_t)recvsize)) {
-				if (foreground)
-					printf("filtered packet from=%s\n", inet_ntoa(fromaddr.sin_addr));
 				log_packet_names(src_ip, (unsigned char *)pkt_data, (size_t)recvsize, "SKIP:service");
 				continue;
 			}
@@ -1039,8 +940,6 @@ int main(int argc, char *argv[]) {
 
 			for (j = 0; j < num_actual_dests; j++) {
 				int dest = actual_dests[j];
-				if (foreground)
-					printf("repeating data to %s\n", socks[dest].ifname);
 				ssize_t sentsize = send_packet(socks[dest].sockfd, pkt_data, (size_t)recvsize);
 				if (sentsize != recvsize) {
 					if (sentsize < 0)
@@ -1071,9 +970,6 @@ end_main:
 		close(socks[i].sockfd);
 		free((char *)socks[i].ifname);
 	}
-
-	if (already_running() == getpid())
-		unlink(pid_file);
 
 	log_message(LOG_INFO, "exit.");
 	return r;
