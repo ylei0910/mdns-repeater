@@ -95,6 +95,9 @@ static int num_filter_services = 0;
 #define SEEN_KEY_LEN 320
 static char seen_keys[MAX_SEEN_NAMES][SEEN_KEY_LEN];
 
+void log_message(int loglevel, char *fmt_str, ...);
+static int dns_read_name(const unsigned char *pkt, size_t pktlen, size_t offset, char *out, size_t outlen);
+
 static int load_service_filter(const char *file) {
 	FILE *f = fopen(file, "r");
 	if (!f) {
