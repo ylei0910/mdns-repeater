@@ -276,7 +276,7 @@ static int packet_matches_filter(const unsigned char *pkt, size_t pktlen) {
 }
 
 /* -------------------------------------------------------------------------
- * Debug log (deduped, format: <subnet/prefix> <src_ip> <name>)
+ * Debug log (deduped, format: <src_ip> <name> -> <dest1/prefix> ... | SKIP)
  * ---------------------------------------------------------------------- */
 
 static int seen_add(const char *key) {
@@ -296,12 +296,11 @@ static int seen_add(const char *key) {
 	return 1;
 }
 
-static void log_packet_names(int sock_idx, const char *src_ip,
-                              const unsigned char *pkt, size_t pktlen) {
+/* dest_str: "-> 192.168.53.0/24 10.108.0.0/16"  or  "SKIP" */
+static void log_packet_names(const char *src_ip,
+                              const unsigned char *pkt, size_t pktlen,
+                              const char *dest_str) {
 	if (!debug_log_fp || pktlen < 12) return;
-	char subnet_str[32];
-	snprintf(subnet_str, sizeof(subnet_str), "%s/%d",
-		inet_ntoa(socks[sock_idx].net), mask_to_prefix(socks[sock_idx].mask));
 	uint16_t qdcount = (pkt[4] << 8) | pkt[5];
 	uint16_t ancount = (pkt[6] << 8) | pkt[7];
 	uint16_t total = qdcount + ancount;
@@ -321,9 +320,9 @@ static void log_packet_names(int sock_idx, const char *src_ip,
 			uint16_t rdlen = (pkt[pos + 8] << 8) | pkt[pos + 9];
 			pos += 10 + rdlen;
 		}
-		snprintf(key, sizeof(key), "%s %s %s", subnet_str, src_ip, name);
+		snprintf(key, sizeof(key), "%s %s %s", src_ip, name, dest_str);
 		if (seen_add(key)) {
-			fprintf(debug_log_fp, "%s %s %s\n", subnet_str, src_ip, name);
+			fprintf(debug_log_fp, "%s %s %s\n", src_ip, name, dest_str);
 			fflush(debug_log_fp);
 		}
 	}
@@ -996,43 +995,44 @@ int main(int argc, char *argv[]) {
 			if (foreground)
 				printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
 
-			/* Service filter */
+			char src_ip[INET_ADDRSTRLEN];
+			inet_ntop(AF_INET, &fromaddr.sin_addr, src_ip, sizeof(src_ip));
+
+			/* Compute actual destination list (routing table + Q-only + same-net) */
+			int actual_dests[MAX_SOCKS];
+			int num_actual_dests = 0;
+			char dest_buf[256] = "->";
+			for (j = 0; j < routing[src_sock].num_dests; j++) {
+				int dest = routing[src_sock].dests[j];
+				if ((fromaddr.sin_addr.s_addr & socks[dest].mask.s_addr) == socks[dest].net.s_addr)
+					continue;
+				if (!socks[src_sock].query_only && socks[dest].query_only && recvsize >= 3) {
+					unsigned char *dns = (unsigned char *)pkt_data;
+					if (!(dns[2] & 0x80)) continue;
+				}
+				actual_dests[num_actual_dests++] = dest;
+				char s[32];
+				snprintf(s, sizeof(s), " %s/%d",
+					inet_ntoa(socks[dest].net), mask_to_prefix(socks[dest].mask));
+				strncat(dest_buf, s, sizeof(dest_buf) - strlen(dest_buf) - 1);
+			}
+
+			/* Service filter — log skipped names before dropping */
 			if (!packet_matches_filter((unsigned char *)pkt_data, (size_t)recvsize)) {
 				if (foreground)
 					printf("filtered packet from=%s\n", inet_ntoa(fromaddr.sin_addr));
+				log_packet_names(src_ip, (unsigned char *)pkt_data, (size_t)recvsize, "SKIP");
 				continue;
 			}
 
-			/* Debug log */
-			{
-				char src_ip[INET_ADDRSTRLEN];
-				inet_ntop(AF_INET, &fromaddr.sin_addr, src_ip, sizeof(src_ip));
-				log_packet_names(src_sock, src_ip, (unsigned char *)pkt_data, (size_t)recvsize);
-			}
+			/* Log and forward */
+			if (num_actual_dests > 0)
+				log_packet_names(src_ip, (unsigned char *)pkt_data, (size_t)recvsize, dest_buf);
 
-			/* Forward to allowed destinations per routing table */
-			for (j = 0; j < routing[src_sock].num_dests; j++) {
-				int dest = routing[src_sock].dests[j];
-
-				/* Skip if destination is on same network as source */
-				if ((fromaddr.sin_addr.s_addr & socks[dest].mask.s_addr) == socks[dest].net.s_addr)
-					continue;
-
-				/* Suppress queries (QR=0) from IoT going to Q interface */
-				if (!socks[src_sock].query_only && socks[dest].query_only && recvsize >= 3) {
-					unsigned char *dns = (unsigned char *)pkt_data;
-					if (!(dns[2] & 0x80)) {
-						if (foreground)
-							printf("suppressing query from IoT %s to Q %s (from=%s)\n",
-								socks[src_sock].ifname, socks[dest].ifname,
-								inet_ntoa(fromaddr.sin_addr));
-						continue;
-					}
-				}
-
+			for (j = 0; j < num_actual_dests; j++) {
+				int dest = actual_dests[j];
 				if (foreground)
 					printf("repeating data to %s\n", socks[dest].ifname);
-
 				ssize_t sentsize = send_packet(socks[dest].sockfd, pkt_data, (size_t)recvsize);
 				if (sentsize != recvsize) {
 					if (sentsize < 0)
