@@ -862,7 +862,6 @@ static void parse_opts(int argc, char *argv[]) {
  * ---------------------------------------------------------------------- */
 
 int main(int argc, char *argv[]) {
-	pid_t running_pid;
 	fd_set sockfd_set;
 	int r = 0;
 	int i;
