@@ -87,9 +87,70 @@ const struct passwd* user = NULL;
 char *debug_log_file = NULL;
 FILE *debug_log_fp = NULL;
 
+char *service_filter_file = NULL;
+static char **filter_services = NULL;
+static int num_filter_services = 0;
+
 #define MAX_SEEN_NAMES 4096
 #define SEEN_KEY_LEN 320
 static char seen_keys[MAX_SEEN_NAMES][SEEN_KEY_LEN];
+
+static int load_service_filter(const char *file) {
+	FILE *f = fopen(file, "r");
+	if (!f) {
+		log_message(LOG_ERR, "cannot open service filter %s: %s", file, strerror(errno));
+		return -1;
+	}
+	char line[256];
+	while (fgets(line, sizeof(line), f)) {
+		int len = strlen(line);
+		while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r' || line[len-1] == ' '))
+			line[--len] = '\0';
+		if (len == 0 || line[0] == '#') continue;
+		char **tmp = realloc(filter_services, (num_filter_services + 1) * sizeof(char *));
+		if (!tmp) { fclose(f); return -1; }
+		filter_services = tmp;
+		filter_services[num_filter_services++] = strdup(line);
+	}
+	fclose(f);
+	return 0;
+}
+
+static int packet_matches_filter(const unsigned char *pkt, size_t pktlen) {
+	if (num_filter_services == 0) return 1;
+	if (pktlen < 12) return 0;
+	uint16_t qdcount = (pkt[4] << 8) | pkt[5];
+	uint16_t ancount = (pkt[6] << 8) | pkt[7];
+	uint16_t total = qdcount + ancount;
+	size_t pos = 12;
+	char name[256];
+	int consumed;
+	uint16_t i;
+	for (i = 0; i < total && pos < pktlen; i++) {
+		consumed = dns_read_name(pkt, pktlen, pos, name, sizeof(name));
+		if (consumed <= 0) break;
+		pos += (size_t)consumed;
+		if (i < qdcount) {
+			if (pos + 4 > pktlen) break;
+			pos += 4;
+		} else {
+			if (pos + 10 > pktlen) break;
+			uint16_t rdlen = (pkt[pos + 8] << 8) | pkt[pos + 9];
+			pos += 10 + rdlen;
+		}
+		size_t name_len = strlen(name);
+		int j;
+		for (j = 0; j < num_filter_services; j++) {
+			size_t svc_len = strlen(filter_services[j]);
+			if (name_len < svc_len) continue;
+			const char *suffix = name + name_len - svc_len;
+			if ((suffix == name || *(suffix - 1) == '.') &&
+			    strcasecmp(suffix, filter_services[j]) == 0)
+				return 1;
+		}
+	}
+	return 0;
+}
 
 static int seen_add(const char *key) {
 	unsigned int h = 5381;
@@ -442,6 +503,7 @@ static void show_help(const char *progname) {
 					"	-w	whitelist subnet (eg. 192.168.1.1/24)\n"
 					"	-p	specifies the pid file path (default: " PIDFILE ")\n"
 					"	-u	run as this user (by name)\n"
+					"	-S	only repeat services listed in file (one service suffix per line)\n"
 					"	-d	log repeated mDNS names to file (deduped, format: <iface> <name>)\n"
 					"	-h	shows this help\n"
 					"\n"
@@ -503,7 +565,7 @@ static int parse_opts(int argc, char *argv[]) {
 	int help = 0;
 	struct subnet *ss;
 	char *msg;
-	while ((c = getopt(argc, argv, "hfQp:b:w:u:d:")) != -1) {
+	while ((c = getopt(argc, argv, "hfQp:b:w:u:d:S:")) != -1) {
 		switch (c) {
 			case 'h': help = 1; break;
 			case 'f': foreground = 1; break;
@@ -594,6 +656,10 @@ static int parse_opts(int argc, char *argv[]) {
 				break;
 			}
 
+			case 'S':
+				service_filter_file = optarg;
+				break;
+
 			case 'd':
 				debug_log_file = optarg;
 				break;
@@ -623,6 +689,14 @@ int main(int argc, char *argv[]) {
 		show_help(argv[0]);
 		log_message(LOG_ERR, "error: at least 2 interfaces must be specified");
 		exit(2);
+	}
+
+	if (service_filter_file) {
+		if (load_service_filter(service_filter_file) < 0) {
+			r = 1;
+			goto end_main;
+		}
+		log_message(LOG_INFO, "service filter loaded: %d entries", num_filter_services);
 	}
 
 	if (debug_log_file) {
@@ -773,6 +847,12 @@ int main(int argc, char *argv[]) {
 			if (foreground)
 				printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
 
+			if (!packet_matches_filter((unsigned char *)pkt_data, (size_t)recvsize)) {
+				if (foreground)
+					printf("filtered packet from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
+				continue;
+			}
+
 			if (src_sock >= 0) {
 				char src_ip[INET_ADDRSTRLEN];
 				inet_ntop(AF_INET, &fromaddr.sin_addr, src_ip, sizeof(src_ip));
@@ -822,6 +902,13 @@ end_main:
 
 	if (debug_log_fp != NULL)
 		fclose(debug_log_fp);
+
+	if (filter_services != NULL) {
+		int i;
+		for (i = 0; i < num_filter_services; i++)
+			free(filter_services[i]);
+		free(filter_services);
+	}
 
 	if (server_sockfd >= 0)
 		close(server_sockfd);
