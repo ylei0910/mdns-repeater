@@ -981,6 +981,9 @@ int main(int argc, char *argv[]) {
 				}
 			}
 
+			char src_ip[INET_ADDRSTRLEN];
+			inet_ntop(AF_INET, &fromaddr.sin_addr, src_ip, sizeof(src_ip));
+
 			/* Drop announcements (QR=1) originating from Q interface */
 			if (socks[src_sock].query_only && recvsize >= 3) {
 				unsigned char *dns = (unsigned char *)pkt_data;
@@ -988,15 +991,13 @@ int main(int argc, char *argv[]) {
 					if (foreground)
 						printf("suppressing announcement from Q iface %s (from=%s)\n",
 							socks[src_sock].ifname, inet_ntoa(fromaddr.sin_addr));
+					log_packet_names(src_ip, (unsigned char *)pkt_data, (size_t)recvsize, "SKIP:Q");
 					continue;
 				}
 			}
 
 			if (foreground)
 				printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
-
-			char src_ip[INET_ADDRSTRLEN];
-			inet_ntop(AF_INET, &fromaddr.sin_addr, src_ip, sizeof(src_ip));
 
 			/* Compute actual destination list (routing table + Q-only + same-net) */
 			int actual_dests[MAX_SOCKS];
@@ -1021,7 +1022,7 @@ int main(int argc, char *argv[]) {
 			if (!packet_matches_filter((unsigned char *)pkt_data, (size_t)recvsize)) {
 				if (foreground)
 					printf("filtered packet from=%s\n", inet_ntoa(fromaddr.sin_addr));
-				log_packet_names(src_ip, (unsigned char *)pkt_data, (size_t)recvsize, "SKIP");
+				log_packet_names(src_ip, (unsigned char *)pkt_data, (size_t)recvsize, "SKIP:service");
 				continue;
 			}
 
