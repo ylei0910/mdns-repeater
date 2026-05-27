@@ -139,7 +139,7 @@ static int dns_read_name(const unsigned char *pkt, size_t pktlen, size_t offset,
 	return -1;
 }
 
-static void log_packet_names(const char *ifname, const unsigned char *pkt, size_t pktlen) {
+static void log_packet_names(const char *ifname, const char *src_ip, const unsigned char *pkt, size_t pktlen) {
 	if (!debug_log_fp || pktlen < 12) return;
 	uint16_t qdcount = (pkt[4] << 8) | pkt[5];
 	uint16_t ancount = (pkt[6] << 8) | pkt[7];
@@ -160,9 +160,9 @@ static void log_packet_names(const char *ifname, const unsigned char *pkt, size_
 			uint16_t rdlen = (pkt[pos + 8] << 8) | pkt[pos + 9];
 			pos += 10 + rdlen;
 		}
-		snprintf(key, sizeof(key), "%s %s", ifname, name);
+		snprintf(key, sizeof(key), "%s %s %s", ifname, src_ip, name);
 		if (seen_add(key)) {
-			fprintf(debug_log_fp, "%s %s\n", ifname, name);
+			fprintf(debug_log_fp, "%s %s %s\n", ifname, src_ip, name);
 			fflush(debug_log_fp);
 		}
 	}
@@ -773,8 +773,11 @@ int main(int argc, char *argv[]) {
 			if (foreground)
 				printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
 
-			if (src_sock >= 0)
-				log_packet_names(socks[src_sock].ifname, (unsigned char *)pkt_data, (size_t)recvsize);
+			if (src_sock >= 0) {
+				char src_ip[INET_ADDRSTRLEN];
+				inet_ntop(AF_INET, &fromaddr.sin_addr, src_ip, sizeof(src_ip));
+				log_packet_names(socks[src_sock].ifname, src_ip, (unsigned char *)pkt_data, (size_t)recvsize);
+			}
 
 			for (j = 0; j < num_socks; j++) {
 				// do not repeat packet back to the same network from which it originated
