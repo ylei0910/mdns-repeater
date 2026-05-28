@@ -4,38 +4,35 @@ mdns-repeater is a Multicast DNS repeater for Linux. Multicast DNS uses the
 224.0.0.251 address, which is "administratively scoped" and does not
 leave the subnet.
 
-This program re-broadcast mDNS packets from one interface to other interfaces.
-It was written primarily to be run on my Linksys WRT54G which runs dd-wrt,
-since my wireless network is on a different subnet from my wired network and
-I would like my zeroconf devices to work properly across the two subnets.
-
-Since the mDNS protocol sends the AA records in the packet itself, the
-repeater does not need to forge the source address. Instead, the source
-address is of the interface that repeats the packet.
+This program re-broadcasts mDNS packets between interfaces. It resolves
+subnets to interfaces at startup via getifaddrs(), so rules are expressed
+as subnet CIDR ranges rather than interface names.
 
 
 USAGE
 -----
-mdns-repeater only requires the interface names and it will do the rest.
-For example, the dd-wrt standard installation defines br0 for the wireless
-interface and vlan1 as the WAN interface, I would use:
+mdns-repeater requires a rules file specifying how subnets are connected:
 
-    mdns-repeater br0 vlan1
+    mdns-repeater -r <rules_file>
 
-You can also specify the -f flag for debugging, which prints packets as they
-are received.
+Each line in the rules file defines one routing group:
+
+    <personal_subnet>:<dest_subnet> [<dest_subnet> ...]
+
+The subnet before the colon is the personal/query-only (Q) network.
+All subnets in the same rule can reach each other, but are isolated from
+subnets in other rules.
+
+Example rules.conf:
+    192.168.53.0/24:10.107.0.0/16 10.108.0.0/16
+    192.168.54.0/24:10.107.0.0/16 10.109.0.0/16
 
 
-QUERY-ONLY MODE (-Q)
+QUERY-ONLY FILTERING
 --------------------
-The -Q flag enables directional mDNS filtering, useful for setups where
-personal and IoT devices are on separate VLANs and you want IoT devices to
-be discoverable from personal networks without exposing personal device
-services to IoT networks.
-
-    mdns-repeater -Q <personal-iface> <iot-iface> [<iot-iface> ...]
-
-The first interface is treated as the personal/query network. Filtering rules:
+The personal subnet (before the colon) automatically gets directional
+filtering. This keeps IoT devices discoverable from personal networks
+without exposing personal device services to IoT networks.
 
   - Personal → IoT : only DNS queries (QR=0) are forwarded;
                      announcements are suppressed
@@ -43,15 +40,50 @@ The first interface is treated as the personal/query network. Filtering rules:
                      queries from IoT to personal are suppressed
   - IoT ↔ IoT      : fully bidirectional, no restrictions
 
-Example for a home lab with personal VLAN on eth1 and IoT VLANs on eth0/eth3:
 
-    mdns-repeater -Q eth1 eth0 eth3
+SERVICE FILTER
+--------------
+To limit repeating to specific service types, pass a services file with
+one mDNS service suffix per line (# comments and blank lines supported):
+
+    mdns-repeater -r rules.conf -S services.conf
+
+Example services.conf:
+    _hap._tcp.local
+    _googlecast._tcp.local
+    _airplay._tcp.local
+
+
+DEBUG LOG
+---------
+To log which names are forwarded or skipped:
+
+    mdns-repeater -r rules.conf -d /var/log/mdns-repeater/seen.log
+
+Log format (one unique entry per src+name+decision triplet):
+
+    <src_ip> <name> -> <dest_subnet> [<dest_subnet> ...]
+    <src_ip> <name> SKIP:Q         (announcement suppressed from Q iface)
+    <src_ip> <name> SKIP:service   (name not in services filter)
+
 
 FLAGS
 -----
-  -f    Run in foreground for debugging; prints packets as they are received
-  -Q    Enable query-only mode; first interface is the personal/query network
-  -b    Blacklist a subnet (e.g. 192.168.1.0/24)
-  -w    Whitelist a subnet (e.g. 192.168.1.0/24)
-  -p    Specify pid file path (default: /var/run/mdns-repeater.pid)
+  -r    Rules file (required)
+  -S    Service filter file (one suffix per line, # comments supported)
+  -d    Debug log file (deduped; append-only)
+  -b    Blacklist a source subnet (e.g. 192.168.1.0/24)
+  -w    Whitelist a source subnet (e.g. 192.168.1.0/24)
   -u    Run as specified user
+
+
+PROCESS MANAGEMENT
+------------------
+mdns-repeater always runs in foreground mode. Use a process supervisor
+such as OpenRC (with command_background=yes) or systemd to manage it:
+
+    # OpenRC /etc/init.d/mdns-repeater
+    command=/usr/local/bin/mdns-repeater
+    command_args="-r /etc/mdns-repeater/rules.conf"
+    command_background=yes
+    pidfile=/var/run/mdns-repeater.pid
